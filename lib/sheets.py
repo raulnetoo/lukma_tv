@@ -1,3 +1,4 @@
+# lib/sheets.py
 import json
 import os
 from functools import lru_cache
@@ -8,15 +9,32 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive"]
 
 def _from_streamlit_secrets():
+    """
+    Lê credenciais do Streamlit Secrets.
+    Aceita tanto:
+      - gcp_service_account como STRING JSON (entre aspas triplas no TOML)
+      - gcp_service_account como OBJETO (TOML -> dict)
+    """
     try:
         import streamlit as st
         svc = st.secrets.get("gcp_service_account", None)
         sid = st.secrets.get("GOOGLE_SHEET_ID", None)
-        if svc and sid:
-            return json.loads(svc), sid
+        if not svc or not sid:
+            return None, None
+
+        # Caso 1: já é dict (TOML como objeto)
+        if isinstance(svc, dict):
+            creds_json = svc
+        else:
+            # Caso 2: é string JSON (entre aspas triplas)
+            try:
+                creds_json = json.loads(svc)
+            except Exception as e:
+                # Erro de parse: retorna None para cair no .env OU levantar erro claro adiante
+                return None, None
+        return creds_json, sid
     except Exception:
-        pass
-    return None, None
+        return None, None
 
 def _from_env():
     json_path = os.getenv("GOOGLE_SA_JSON_PATH")
@@ -29,71 +47,29 @@ def _from_env():
 
 @lru_cache(maxsize=1)
 def get_client_and_sheet():
+    """
+    Tenta Secrets primeiro; se falhar, tenta .env.
+    Se ainda faltar algo, explica exatamente o que está faltando.
+    """
     creds_json, sheet_id = _from_streamlit_secrets()
     if creds_json is None or sheet_id is None:
-        creds_json, sheet_id = _from_env()
-    if creds_json is None or sheet_id is None:
-        raise RuntimeError("Credenciais/GOOGLE_SHEET_ID não configurados.")
+        creds_json_env, sheet_id_env = _from_env()
+        creds_json = creds_json or creds_json_env
+        sheet_id = sheet_id or sheet_id_env
+
+    missing = []
+    if creds_json is None:
+        missing.append("gcp_service_account (nos Secrets) ou GOOGLE_SA_JSON_PATH (no .env)")
+    if sheet_id is None:
+        missing.append("GOOGLE_SHEET_ID (Secrets ou .env)")
+
+    if missing:
+        raise RuntimeError(
+            "Config faltando: " + ", ".join(missing) +
+            ". No Streamlit Cloud use Settings→Secrets com chaves gcp_service_account e GOOGLE_SHEET_ID."
+        )
 
     credentials = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
     client = gspread.authorize(credentials)
     sheet = client.open_by_key(sheet_id)
     return client, sheet
-
-def get_ws(name: str, headers: list[str] | None = None):
-    _, sheet = get_client_and_sheet()
-    try:
-        ws = sheet.worksheet(name)
-    except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=name, rows=1000, cols=20)
-        if headers:
-            ws.append_row(headers)
-    return ws
-
-def read_all(name: str) -> list[dict]:
-    ws = get_ws(name)
-    rows = ws.get_all_records()
-    return rows
-
-def upsert_row(name: str, key_field: str, data: dict):
-    ws = get_ws(name)
-    records = ws.get_all_records()
-    headers = ws.row_values(1)
-    if key_field not in headers:
-        raise ValueError(f"Campo-chave {key_field} não existe em {name}.")
-
-    # acha linha (2-based index por causa do header na linha 1)
-    for idx, rec in enumerate(records, start=2):
-        if str(rec.get(key_field)) == str(data.get(key_field)):
-            # update
-            row_values = [data.get(h, "") for h in headers]
-            ws.update(f"A{idx}:{chr(64+len(headers))}{idx}", [row_values])
-            return
-
-    # insert
-    # garante headers
-    if not headers:
-        headers = list(data.keys())
-        ws.append_row(headers)
-    row_values = [data.get(h, "") for h in headers]
-    ws.append_row(row_values)
-
-def delete_row(name: str, key_field: str, key_value: str | int):
-    ws = get_ws(name)
-    records = ws.get_all_records()
-    headers = ws.row_values(1)
-    key_idx = headers.index(key_field) + 1
-    for idx, rec in enumerate(records, start=2):
-        if str(rec.get(key_field)) == str(key_value):
-            ws.delete_rows(idx)
-            return True
-    return False
-
-def ensure_seed():
-    # cria abas e cabeçalhos se faltarem
-    get_ws("news", ["id","title","description","image_url","active","order"])
-    get_ws("videos", ["id","title","url","duration_seconds","active","order"])
-    get_ws("birthdays", ["id","name","department","day","month","photo_url","active"])
-    get_ws("users", ["username","full_name","role","password_hash",
-                     "can_news","can_videos","can_birthdays","can_weather","can_fx","can_clocks"])
-    get_ws("config", ["key","value"])
